@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/streadway/amqp"
 
 	"go.uber.org/zap"
 	v1 "k8s.io/api/apps/v1"
@@ -43,6 +44,8 @@ import (
 	"knative.dev/eventing/pkg/duck"
 	pkgreconciler "knative.dev/pkg/reconciler"
 	"knative.dev/pkg/resolver"
+
+	kedav1alpha1 "github.com/markfisher/rokn/pkg/internal/thirdparty/keda/v1alpha1"
 )
 
 const (
@@ -104,13 +107,13 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, t *v1beta1.Trigger) pkgr
 
 	// 1. RabbitMQ Queue
 	// 2. RabbitMQ Binding.
-	// 3. Dispatcher Deployment for Subscriber.
+	// 3. Dispatcher Deployment for Subscriber + KEDA ScaledObject with 1 RabbitMQ Scaler
 	rabbitmqURL, err := r.rabbitmqURL(ctx, t)
 	if err != nil {
 		return err
 	}
 
-	_, err = resources.DeclareQueue(&resources.QueueArgs{
+	queue, err := resources.DeclareQueue(&resources.QueueArgs{
 		Trigger:     t,
 		RabbitmqURL: rabbitmqURL,
 	})
@@ -162,13 +165,14 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, t *v1beta1.Trigger) pkgr
 		},
 	)
 
-	if err := r.reconcileDispatcherDeployment(ctx, t, subscriberURI); err != nil {
+	deployment, err := r.reconcileDispatcherDeployment(ctx, t, subscriberURI)
+	if err != nil {
 		logging.FromContext(ctx).Error("Problem reconciling dispatcher Deployment", zap.Error(err))
 		t.Status.MarkDependencyFailed("DeploymentFailure", "%v", err)
 		return err
 	}
 
-	return nil
+	return r.reconcileScaledObject(ctx, queue, deployment)
 }
 
 func (r *Reconciler) FinalizeKind(ctx context.Context, t *v1beta1.Trigger) pkgreconciler.Event {
@@ -188,36 +192,38 @@ func (r *Reconciler) FinalizeKind(ctx context.Context, t *v1beta1.Trigger) pkgre
 }
 
 // reconcileDeployment reconciles the K8s Deployment 'd'.
-func (r *Reconciler) reconcileDeployment(ctx context.Context, d *v1.Deployment) error {
+func (r *Reconciler) reconcileDeployment(ctx context.Context, d *v1.Deployment) (*v1.Deployment, error) {
 	current, err := r.deploymentLister.Deployments(d.Namespace).Get(d.Name)
 	if apierrs.IsNotFound(err) {
 		_, err = r.kubeClientSet.AppsV1().Deployments(d.Namespace).Create(d)
 		if err != nil {
-			return err
+			return nil, err
 		}
+		return d, nil
 	} else if err != nil {
-		return err
+		return nil, err
 	} else if !equality.Semantic.DeepDerivative(d.Spec, current.Spec) {
 		// Don't modify the informers copy.
 		desired := current.DeepCopy()
 		desired.Spec = d.Spec
 		_, err = r.kubeClientSet.AppsV1().Deployments(desired.Namespace).Update(desired)
 		if err != nil {
-			return err
+			return nil, err
 		}
+		return desired, nil
 	}
-	return nil
+	return current, nil
 }
 
 //reconcileDispatcherDeployment reconciles Trigger's dispatcher deployment.
-func (r *Reconciler) reconcileDispatcherDeployment(ctx context.Context, t *v1beta1.Trigger, sub *apis.URL) error {
+func (r *Reconciler) reconcileDispatcherDeployment(ctx context.Context, t *v1beta1.Trigger, sub *apis.URL) (*v1.Deployment, error) {
 	rabbitmqSecret, err := r.getRabbitmqSecret(ctx, t)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	broker, err := r.brokerLister.Brokers(t.Namespace).Get(t.Spec.Broker)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	expected := resources.MakeDispatcherDeployment(&resources.DispatcherArgs{
 		Trigger: t,
@@ -326,4 +332,43 @@ func (r *Reconciler) rabbitmqURL(ctx context.Context, t *v1beta1.Trigger) (strin
 		return "", err
 	}
 	return fmt.Sprintf("amqp://%s:%s@%s:5672", s.Data["username"], s.Data["password"], s.Data["host"]), nil
+}
+
+func (r *Reconciler) reconcileScaledObject(ctx context.Context, queue *amqp.Queue, deployment *v1.Deployment) error {
+	zero := int32(0)
+	one := int32(1)
+	maxReplicas := maxReplicasFor(queue)
+	desiredScaledObject := &kedav1alpha1.ScaledObject{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: fmt.Sprintf("%s-dispatcher-", deployment.Name),
+			Namespace:    deployment.Namespace,
+			Labels:       deployment.Labels,
+		},
+		Spec: kedav1alpha1.ScaledObjectSpec{
+			ScaleTargetRef: &kedav1alpha1.ObjectReference{
+				DeploymentName: deployment.Name,
+			},
+			PollingInterval: &one,
+			Triggers: []kedav1alpha1.ScaleTriggers{
+				{
+					Type: "rabbitmq",
+					Metadata: map[string]string{
+						// TODO
+					},
+				},
+			},
+			MinReplicaCount: &zero,
+			MaxReplicaCount: &maxReplicas,
+		},
+	}
+	// TODO: replace Println with reconciliation logic
+	fmt.Println(desiredScaledObject)
+	return nil
+}
+
+func maxReplicasFor(queue *amqp.Queue) int32 {
+	if queue.Messages > 0 {
+		return 1
+	}
+	return 0
 }
